@@ -415,6 +415,70 @@ export async function setEmployeeEmail(uid, email, orgId) {
   return { ok: true, email: next, changed: true, previousEmail: current || null };
 }
 
+// Org-wide version of diagnoseAuthLink, for when you need to know whether a
+// broken sign-in is one row or the whole org — and, crucially, WHICH Firebase
+// project the running deployment is talking to. scripts/audit-auth-links.mjs
+// answers the same question from a laptop, but it can only ever use local
+// credentials; this runs wherever it is deployed, so it reports the truth about
+// that environment. Strictly read-only.
+export async function auditAuthLinks(orgId) {
+  const { app, auth } = firebaseAdmin();
+  const rows = await sql`SELECT firebase_uid, email, name, role FROM users WHERE org_id=${orgId} ORDER BY role, email`;
+
+  // One getUsers() call per 100 rows instead of one getUser() per row.
+  const found = new Map();
+  const missing = new Set();
+  for (let i = 0; i < rows.length; i += 100) {
+    const chunk = rows.slice(i, i + 100);
+    const res = await auth.getUsers(chunk.map((r) => ({ uid: r.firebase_uid })));
+    for (const u of res.users) found.set(u.uid, u);
+    for (const nf of res.notFound) missing.add(nf.uid);
+  }
+
+  const counts = new Map();
+  const findings = [];
+  for (const r of rows) {
+    const email = String(r.email || '').trim().toLowerCase();
+    let state;
+    let detail = null;
+
+    if (!email) {
+      state = 'NO_EMAIL';
+    } else if (missing.has(r.firebase_uid)) {
+      // No account at this uid — is the address free, or owned by another uid?
+      let owner = null;
+      try {
+        owner = (await auth.getUserByEmail(email)).uid;
+      } catch (err) {
+        if (err?.code !== 'auth/user-not-found') throw firebaseAuthError(err);
+      }
+      state = owner ? 'UID_CONFLICT' : 'ORPHAN';
+      if (owner) detail = `email belongs to Auth uid ${owner}`;
+    } else {
+      const authEmail = String(found.get(r.firebase_uid)?.email || '');
+      if (authEmail.toLowerCase() !== email) {
+        state = 'EMAIL_SKEW';
+        detail = `Auth has "${authEmail || '—'}"`;
+      } else {
+        state = 'OK';
+      }
+    }
+
+    counts.set(state, (counts.get(state) || 0) + 1);
+    if (state !== 'OK') findings.push({ uid: r.firebase_uid, email: r.email, name: r.name, role: r.role, state, detail });
+  }
+
+  return {
+    // The whole point of running this in-environment: name the project.
+    firebaseProjectId: app.options?.projectId ?? null,
+    orgId,
+    total: rows.length,
+    counts: Object.fromEntries(counts),
+    healthy: findings.length === 0,
+    findings,
+  };
+}
+
 // ---- Neon <-> Firebase Auth reconciliation ---------------------------------
 // A users row whose firebase_uid has no Firebase Auth account behind it (an
 // "orphan") breaks every Auth-touching admin action. repairAuthAccount rebuilds

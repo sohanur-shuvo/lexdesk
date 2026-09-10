@@ -27,6 +27,7 @@ export {
   changePassword,
   diagnoseAuthLink,
   repairAuthAccount,
+  auditAuthLinks,
   writeAuditLog,
 } from './services/users';
 export { enforceLoginGuards, resetUserDevices, setUserLoginIps, isRestrictedRole, MAX_LOGIN_DEVICES } from './services/loginGuard';
